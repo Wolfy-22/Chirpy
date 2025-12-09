@@ -1,12 +1,18 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync/atomic"
+
+	"github.com/Wolfy-22/Chirpy.git/internal/database"
+	"github.com/joho/godotenv"
+	_ "github.com/lib/pq"
 )
 
 const (
@@ -15,12 +21,23 @@ const (
 
 type apiConfig struct {
 	fileserverHits atomic.Int32
+	dbQueries      *database.Queries
 }
 
 func main() {
+	godotenv.Load()
+	dbURL := os.Getenv("DB_URL")
+	db, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Printf("Error connecting to database: %w", err)
+		os.Exit(1)
+	}
+	dbQ := database.New(db)
+
 	mux := http.NewServeMux()
 	apiCfg := apiConfig{
 		fileserverHits: atomic.Int32{},
+		dbQueries:      dbQ,
 	}
 
 	mux.Handle("/app/", apiCfg.middlewareMetricsInc(handler()))
