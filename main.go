@@ -9,8 +9,10 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/Wolfy-22/Chirpy.git/internal/database"
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
@@ -44,6 +46,7 @@ func main() {
 
 	mux.HandleFunc("GET /api/healthz", endPointHandler)
 	mux.HandleFunc("POST /api/validate_chirp", validateChirp)
+	mux.HandleFunc("POST /api/users")
 	mux.HandleFunc("GET /admin/metrics", apiCfg.writeNumberRequest)
 	mux.HandleFunc("POST /admin/reset", apiCfg.resetHits)
 
@@ -54,6 +57,23 @@ func main() {
 
 	server.ListenAndServe()
 
+}
+
+func addUser(res http.ResponseWriter, req *http.Request) {
+	type userData struct {
+		ID        uuid.UUID `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Email     string    `json:"email"`
+	}
+
+	reqEmail := req.Body
+	decoder := json.NewDecoder(reqEmail)
+	Data := userData{}
+	err := decoder.Decode(&Data)
+	if err != nil {
+
+	}
 }
 
 func validateChirp(res http.ResponseWriter, req *http.Request) {
