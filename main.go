@@ -53,6 +53,7 @@ func main() {
 	mux.HandleFunc("GET /admin/metrics", apiCfg.writeNumberRequest)
 	mux.HandleFunc("POST /admin/reset", apiCfg.resetAll)
 	mux.HandleFunc("GET /api/chirps", apiCfg.getChirps)
+	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirp)
 
 	server := http.Server{
 		Handler: mux,
@@ -63,15 +64,77 @@ func main() {
 
 }
 
+func (cfg *apiConfig) getChirp(res http.ResponseWriter, req *http.Request) {
+	type Chirp struct {
+		ID        uuid.UUID `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Body      string    `json:"body"`
+		UserID    uuid.UUID `json:"user_id"`
+	}
+
+	id, err := uuid.Parse(req.PathValue("chirpID"))
+	if err != nil {
+		log.Printf("Error getting ID: %s", err)
+		res.WriteHeader(404)
+		return
+	}
+	chirp, err := cfg.dbQueries.GetChirpByID(req.Context(), id)
+	if err != nil {
+		log.Printf("Error getting chirps: %s", err)
+		res.WriteHeader(404)
+		return
+	}
+
+	fixedChirp := Chirp{
+		ID:        chirp.ID,
+		CreatedAt: chirp.CreatedAt,
+		UpdatedAt: chirp.UpdatedAt,
+		Body:      chirp.Body,
+		UserID:    chirp.UserID,
+	}
+
+	dat, err := json.Marshal(fixedChirp)
+	if err != nil {
+		log.Printf("Error marshalling json: %s", err)
+		res.WriteHeader(404)
+		return
+	}
+
+	res.Header().Set("Content-Type", "application/json")
+	res.WriteHeader(200)
+	res.Write(dat)
+}
+
 func (cfg *apiConfig) getChirps(res http.ResponseWriter, req *http.Request) {
+	type Chirp struct {
+		ID        uuid.UUID `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Body      string    `json:"body"`
+		UserID    uuid.UUID `json:"user_id"`
+	}
+
 	chirps, err := cfg.dbQueries.GetAllChirps(req.Context())
 	if err != nil {
 		log.Printf("Error getting chirps: %s", err)
 		res.WriteHeader(400)
 		return
 	}
+	var fixedChirps []Chirp
+	var fixedChrip Chirp
+	for _, chirp := range chirps {
+		fixedChrip = Chirp{
+			ID:        chirp.ID,
+			CreatedAt: chirp.CreatedAt,
+			UpdatedAt: chirp.UpdatedAt,
+			Body:      chirp.Body,
+			UserID:    chirp.UserID,
+		}
+		fixedChirps = append(fixedChirps, fixedChrip)
+	}
 
-	dat, err := json.Marshal(chirps)
+	dat, err := json.Marshal(fixedChirps)
 	if err != nil {
 		log.Printf("Error marshalling json: %s", err)
 		res.WriteHeader(400)
