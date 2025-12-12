@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Wolfy-22/Chirpy.git/internal/auth"
 	"github.com/Wolfy-22/Chirpy.git/internal/database"
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -25,12 +26,14 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	dbQueries      *database.Queries
 	platform       string
+	secret         string
 }
 
 func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
+	secret := os.Getenv("SECRET")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Printf("Error connecting to database: %s", err)
@@ -43,6 +46,7 @@ func main() {
 		fileserverHits: atomic.Int32{},
 		dbQueries:      dbQ,
 		platform:       platform,
+		secret:         secret,
 	}
 
 	mux.Handle("/app/", apiCfg.middlewareMetricsInc(handler()))
@@ -54,6 +58,7 @@ func main() {
 	mux.HandleFunc("POST /admin/reset", apiCfg.resetAll)
 	mux.HandleFunc("GET /api/chirps", apiCfg.getChirps)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirp)
+	mux.HandleFunc("POST /api/login", apiCfg.login)
 
 	server := http.Server{
 		Handler: mux,
@@ -62,6 +67,82 @@ func main() {
 
 	server.ListenAndServe()
 
+}
+
+func (cfg *apiConfig) login(res http.ResponseWriter, req *http.Request) {
+	type userData struct {
+		Email     string `json:"email"`
+		Password  string `json:"password"`
+		ExpiresIn int    `json:"expire_in_seconds"`
+	}
+
+	type loginResponse struct {
+		ID        uuid.UUID `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Email     string    `json:"email"`
+		Token     string    `json:"token"`
+	}
+
+	decoder := json.NewDecoder(req.Body)
+	Data := userData{}
+	err := decoder.Decode(&Data)
+	if err != nil {
+		log.Printf("Error decoding request body: %s", err)
+		res.WriteHeader(400)
+		return
+	}
+
+	user, err := cfg.dbQueries.GetUserByEmail(req.Context(), Data.Email)
+	if err != nil {
+		log.Printf("Error getting user: %s", err)
+		res.WriteHeader(http.StatusUnauthorized)
+		res.Write([]byte("incorrect email or password"))
+
+		return
+	}
+
+	match, err := auth.CheckPasswordHash(Data.Password, user.HashedPassword)
+	if err != nil || !match {
+		log.Printf("Error checking password: %s", err)
+		res.WriteHeader(http.StatusUnauthorized)
+		res.Write([]byte("incorrect email or password"))
+
+		return
+	}
+
+	duration := time.Duration(0)
+	if Data.ExpiresIn == 0 {
+		duration = time.Hour
+	} else {
+		duration = time.Duration(Data.ExpiresIn)
+	}
+
+	token, err := auth.MakeJWT(user.ID, cfg.secret, duration)
+	if err != nil {
+		log.Printf("Error genrating token: %v", err)
+		res.WriteHeader(400)
+		return
+	}
+
+	respBody := loginResponse{
+		ID:        user.ID,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+		Email:     user.Email,
+		Token:     token,
+	}
+
+	dat, err := json.Marshal(respBody)
+	if err != nil {
+		log.Printf("Error marhalling JSON: %s", err)
+		res.WriteHeader(500)
+		return
+	}
+
+	res.Header().Set("Content-Type", "application/json")
+	res.WriteHeader(200)
+	res.Write(dat)
 }
 
 func (cfg *apiConfig) getChirp(res http.ResponseWriter, req *http.Request) {
@@ -147,16 +228,21 @@ func (cfg *apiConfig) getChirps(res http.ResponseWriter, req *http.Request) {
 }
 
 func (cfg *apiConfig) addUser(res http.ResponseWriter, req *http.Request) {
+	type userParams struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+
 	type userData struct {
 		ID        uuid.UUID `json:"id"`
 		CreatedAt time.Time `json:"created_at"`
 		UpdatedAt time.Time `json:"updated_at"`
 		Email     string    `json:"email"`
+		Password  string    `json:"hashed_password"`
 	}
 
-	reqEmail := req.Body
-	decoder := json.NewDecoder(reqEmail)
-	Data := userData{}
+	decoder := json.NewDecoder(req.Body)
+	Data := userParams{}
 	err := decoder.Decode(&Data)
 	if err != nil {
 		log.Printf("Error decoding request body: %s", err)
@@ -164,7 +250,17 @@ func (cfg *apiConfig) addUser(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	user, err := cfg.dbQueries.CreateUser(req.Context(), Data.Email)
+	hashedPassword, err := auth.HashPassword(Data.Password)
+	if err != nil {
+		log.Printf("Error hashing password: %s", err)
+		res.WriteHeader(400)
+		return
+	}
+
+	user, err := cfg.dbQueries.CreateUser(req.Context(), database.CreateUserParams{
+		Email:          Data.Email,
+		HashedPassword: hashedPassword,
+	})
 	if err != nil {
 		log.Printf("Error creating user: %s", err)
 		res.WriteHeader(400)
@@ -213,9 +309,21 @@ func (cfg *apiConfig) createChirp(res http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		log.Printf("Error decoding chirp: %s", err)
 		res.WriteHeader(400)
-		chirpBody = ""
-		chirpError = "Something went wrong"
-		chirpValid = false
+		return
+	}
+
+	token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		log.Printf("Error getting token: %v", err)
+		res.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	userId, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		log.Printf("Error getting token: %v", err)
+		res.WriteHeader(http.StatusUnauthorized)
+		return
 	}
 
 	if len(chirp.Body) > 140 {
@@ -239,7 +347,7 @@ func (cfg *apiConfig) createChirp(res http.ResponseWriter, req *http.Request) {
 
 	CHIRP, err := cfg.dbQueries.CreateChirp(req.Context(), database.CreateChirpParams{
 		Body:   cleaned,
-		UserID: chirp.UserID,
+		UserID: userId,
 	})
 	if err != nil {
 		log.Printf("Error creating chrip: %s", err)
@@ -248,7 +356,7 @@ func (cfg *apiConfig) createChirp(res http.ResponseWriter, req *http.Request) {
 	}
 
 	respBody := Chirp{
-		ID:        CHIRP.ID,
+		ID:        userId,
 		CreatedAt: CHIRP.CreatedAt,
 		UpdatedAt: CHIRP.UpdatedAt,
 		Body:      CHIRP.Body,
