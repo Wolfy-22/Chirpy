@@ -1,6 +1,9 @@
 package auth
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -9,6 +12,15 @@ import (
 	"github.com/alexedwards/argon2id"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+)
+
+type TokenType string
+
+var ErrNoAuthHeaderIncluded = errors.New("no auth header included in request")
+
+const (
+	// TokenTypeAccess -
+	TokenTypeAccess TokenType = "chirpy"
 )
 
 func HashPassword(pswd string) (string, error) {
@@ -46,31 +58,56 @@ func MakeJWT(userId uuid.UUID, tokenSecret string, expiresIn time.Duration) (str
 }
 
 func ValidateJWT(tokenString, tokenSecret string) (uuid.UUID, error) {
-	token, err := jwt.ParseWithClaims(tokenString, &jwt.RegisteredClaims{}, func(t *jwt.Token) (any, error) { return []byte(tokenSecret), nil })
+	claimsStruct := jwt.RegisteredClaims{}
+	token, err := jwt.ParseWithClaims(
+		tokenString,
+		&claimsStruct,
+		func(token *jwt.Token) (interface{}, error) { return []byte(tokenSecret), nil },
+	)
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("error parsing token: %w", err)
+		return uuid.Nil, err
 	}
 
-	stringUserId, err := token.Claims.GetSubject()
+	userIDString, err := token.Claims.GetSubject()
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("error getting id: %w", err)
+		return uuid.Nil, err
 	}
 
-	userId, err := uuid.Parse(stringUserId)
+	issuer, err := token.Claims.GetIssuer()
 	if err != nil {
-		return uuid.Nil, fmt.Errorf("error parsing user id: %w", err)
+		return uuid.Nil, err
+	}
+	if issuer != string(TokenTypeAccess) {
+		return uuid.Nil, errors.New("invalid issuer")
 	}
 
-	return userId, nil
-
+	id, err := uuid.Parse(userIDString)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("invalid user ID: %w", err)
+	}
+	return id, nil
 }
 
 func GetBearerToken(headers http.Header) (string, error) {
-
-	token := headers.Get("Authorization")
-	if len(token) == 0 {
-		return "", fmt.Errorf("header does not exist")
+	authHeader := headers.Get("Authorization")
+	if authHeader == "" {
+		return "", ErrNoAuthHeaderIncluded
 	}
-	strippedtoken := strings.Split(token, " ")
-	return strippedtoken[1], nil
+	splitAuth := strings.Split(authHeader, " ")
+	if len(splitAuth) < 2 || splitAuth[0] != "Bearer" {
+		return "", errors.New("malformed authorization header")
+	}
+
+	return splitAuth[1], nil
+}
+
+func MakeRefreshToken() (string, error) {
+	tokenBytes := make([]byte, 32)
+	_, err := rand.Read(tokenBytes)
+	if err != nil {
+		return "", fmt.Errorf("error generating token: %w", err)
+	}
+	token := hex.EncodeToString(tokenBytes)
+
+	return token, nil
 }

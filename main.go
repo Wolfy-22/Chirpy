@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -59,6 +60,8 @@ func main() {
 	mux.HandleFunc("GET /api/chirps", apiCfg.getChirps)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.getChirp)
 	mux.HandleFunc("POST /api/login", apiCfg.login)
+	mux.HandleFunc("POST /api/refresh", apiCfg.refresh)
+	mux.HandleFunc("POST /api/revoke", apiCfg.revokeToken)
 
 	server := http.Server{
 		Handler: mux,
@@ -69,19 +72,67 @@ func main() {
 
 }
 
+func (cfg *apiConfig) revokeToken(res http.ResponseWriter, req *http.Request) {
+	refreshToken, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(res, http.StatusBadRequest, "Couldn't find token", err)
+		return
+	}
+
+	_, err = cfg.dbQueries.RevokeRefreshToken(req.Context(), refreshToken)
+	if err != nil {
+		respondWithError(res, http.StatusInternalServerError, "Couldn't revoke session", err)
+		return
+	}
+
+	res.WriteHeader(http.StatusNoContent)
+}
+
+func (cfg *apiConfig) refresh(res http.ResponseWriter, req *http.Request) {
+	type refreshResponse struct {
+		Token string `json:"token"`
+	}
+
+	refreshToken, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(res, http.StatusBadRequest, "Couldn't find token", err)
+		return
+	}
+
+	user, err := cfg.dbQueries.GetUserFromRefreshToken(req.Context(), refreshToken)
+	if err != nil {
+		respondWithError(res, http.StatusUnauthorized, "Couldn't get user from refresh token", err)
+		return
+	}
+
+	accessToken, err := auth.MakeJWT(
+		user.ID,
+		cfg.secret,
+		time.Hour,
+	)
+	if err != nil {
+		respondWithError(res, http.StatusUnauthorized, "Couldn't validate token", err)
+		return
+	}
+
+	respondWithJSON(res, http.StatusOK, refreshResponse{
+		Token: accessToken,
+	})
+}
+
 func (cfg *apiConfig) login(res http.ResponseWriter, req *http.Request) {
 	type userData struct {
-		Email     string `json:"email"`
-		Password  string `json:"password"`
-		ExpiresIn int    `json:"expire_in_seconds"`
+		Email    string `json:"email"`
+		Password string `json:"password"`
 	}
 
 	type loginResponse struct {
-		ID        uuid.UUID `json:"id"`
-		CreatedAt time.Time `json:"created_at"`
-		UpdatedAt time.Time `json:"updated_at"`
-		Email     string    `json:"email"`
-		Token     string    `json:"token"`
+		ID           uuid.UUID `json:"id"`
+		CreatedAt    time.Time `json:"created_at"`
+		UpdatedAt    time.Time `json:"updated_at"`
+		Email        string    `json:"email"`
+		RefreshToken string    `json:"refresh_token"`
+		AccessToken  string    `json:"token"`
 	}
 
 	decoder := json.NewDecoder(req.Body)
@@ -111,26 +162,36 @@ func (cfg *apiConfig) login(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	duration := time.Duration(0)
-	if Data.ExpiresIn == 0 {
-		duration = time.Hour
-	} else {
-		duration = time.Duration(Data.ExpiresIn)
-	}
-
-	token, err := auth.MakeJWT(user.ID, cfg.secret, duration)
+	access_token, err := auth.MakeJWT(user.ID, cfg.secret, time.Hour)
 	if err != nil {
-		log.Printf("Error genrating token: %v", err)
+		log.Printf("Error genrating access token: %v", err)
 		res.WriteHeader(400)
 		return
 	}
 
+	refresh_token, err := auth.MakeRefreshToken()
+	if err != nil {
+		log.Printf("Error generating refresh token: %v", err)
+		res.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	_, err = cfg.dbQueries.CreateToken(req.Context(), database.CreateTokenParams{
+		Token:     refresh_token,
+		UserID:    user.ID,
+		ExpiresAt: time.Now().UTC().Add(time.Hour * 24 * 60),
+	})
+	if err != nil {
+		log.Printf("Error saving refresh token: %v", err)
+	}
+
 	respBody := loginResponse{
-		ID:        user.ID,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-		Email:     user.Email,
-		Token:     token,
+		ID:           user.ID,
+		CreatedAt:    user.CreatedAt,
+		UpdatedAt:    user.UpdatedAt,
+		Email:        user.Email,
+		AccessToken:  access_token,
+		RefreshToken: refresh_token,
 	}
 
 	dat, err := json.Marshal(respBody)
@@ -292,88 +353,82 @@ func (cfg *apiConfig) createChirp(res http.ResponseWriter, req *http.Request) {
 		ID        uuid.UUID `json:"id"`
 		CreatedAt time.Time `json:"created_at"`
 		UpdatedAt time.Time `json:"updated_at"`
-		Body      string    `json:"body"`
 		UserID    uuid.UUID `json:"user_id"`
-		Error     string    `json:"error"`
-		Valid     bool      `json:"valid"`
+		Body      string    `json:"body"`
 	}
 
-	chirpBody := ""
-	chirpError := ""
-	chirpValid := true
-
-	Body := req.Body
-	decoder := json.NewDecoder(Body)
-	chirp := Chirp{}
-	err := decoder.Decode(&chirp)
-	if err != nil {
-		log.Printf("Error decoding chirp: %s", err)
-		res.WriteHeader(400)
-		return
+	type parameters struct {
+		Body string `json:"body"`
 	}
 
 	token, err := auth.GetBearerToken(req.Header)
 	if err != nil {
-		log.Printf("Error getting token: %v", err)
-		res.WriteHeader(http.StatusUnauthorized)
+		respondWithError(res, http.StatusUnauthorized, "Couldn't find JWT", err)
 		return
 	}
-
-	userId, err := auth.ValidateJWT(token, cfg.secret)
+	userID, err := auth.ValidateJWT(token, cfg.secret)
 	if err != nil {
-		log.Printf("Error getting token: %v", err)
-		res.WriteHeader(http.StatusUnauthorized)
+		respondWithError(res, http.StatusUnauthorized, "Couldn't validate JWT", err)
 		return
 	}
 
-	if len(chirp.Body) > 140 {
-		chirpBody = ""
-		chirpError = "Chirp is too long"
-		chirpValid = false
-		res.WriteHeader(400)
-	} else {
-		chirpBody = chirp.Body
+	decoder := json.NewDecoder(req.Body)
+	params := parameters{}
+	err = decoder.Decode(&params)
+	if err != nil {
+		respondWithError(res, http.StatusInternalServerError, "Couldn't decode parameters", err)
+		return
 	}
 
-	splitBody := strings.Split(chirpBody, " ")
-	var bodysplice []string
-	for _, word := range splitBody {
-		if strings.ToLower(word) == "kerfuffle" || strings.ToLower(word) == "sharbert" || strings.ToLower(word) == "fornax" {
-			word = "****"
-		}
-		bodysplice = append(bodysplice, word)
+	cleaned, err := validateChirp(params.Body)
+	if err != nil {
+		respondWithError(res, http.StatusBadRequest, err.Error(), err)
+		return
 	}
-	cleaned := strings.Join(bodysplice, " ")
 
-	CHIRP, err := cfg.dbQueries.CreateChirp(req.Context(), database.CreateChirpParams{
+	chirp, err := cfg.dbQueries.CreateChirp(req.Context(), database.CreateChirpParams{
 		Body:   cleaned,
-		UserID: userId,
+		UserID: userID,
 	})
 	if err != nil {
-		log.Printf("Error creating chrip: %s", err)
-		res.WriteHeader(400)
+		respondWithError(res, http.StatusInternalServerError, "Couldn't create chirp", err)
 		return
 	}
 
-	respBody := Chirp{
-		ID:        userId,
-		CreatedAt: CHIRP.CreatedAt,
-		UpdatedAt: CHIRP.UpdatedAt,
-		Body:      CHIRP.Body,
-		UserID:    CHIRP.UserID,
-		Error:     chirpError,
-		Valid:     chirpValid,
+	respondWithJSON(res, http.StatusCreated, Chirp{
+		ID:        chirp.ID,
+		CreatedAt: chirp.CreatedAt,
+		UpdatedAt: chirp.UpdatedAt,
+		Body:      chirp.Body,
+		UserID:    chirp.UserID,
+	})
+}
+
+func validateChirp(body string) (string, error) {
+	const maxChirpLength = 140
+	if len(body) > maxChirpLength {
+		return "", errors.New("Chirp is too long")
 	}
 
-	dat, err := json.Marshal(respBody)
-	if err != nil {
-		log.Printf("Error marshalling JSON: %s", err)
-		res.WriteHeader(500)
-		return
+	badWords := map[string]struct{}{
+		"kerfuffle": {},
+		"sharbert":  {},
+		"fornax":    {},
 	}
-	res.Header().Set("Content-Type", "application/json")
-	res.WriteHeader(201)
-	res.Write(dat)
+	cleaned := getCleanedBody(body, badWords)
+	return cleaned, nil
+}
+
+func getCleanedBody(body string, badWords map[string]struct{}) string {
+	words := strings.Split(body, " ")
+	for i, word := range words {
+		loweredWord := strings.ToLower(word)
+		if _, ok := badWords[loweredWord]; ok {
+			words[i] = "****"
+		}
+	}
+	cleaned := strings.Join(words, " ")
+	return cleaned
 }
 
 func endPointHandler(res http.ResponseWriter, req *http.Request) {
@@ -416,4 +471,31 @@ func (cfg *apiConfig) resetAll(res http.ResponseWriter, req *http.Request) {
 	}
 	res.WriteHeader(200)
 	res.Write([]byte("OK\n"))
+}
+
+func respondWithError(req http.ResponseWriter, code int, msg string, err error) {
+	if err != nil {
+		log.Println(err)
+	}
+	if code > 499 {
+		log.Printf("Responding with 5XX error: %s", msg)
+	}
+	type errorResponse struct {
+		Error string `json:"error"`
+	}
+	respondWithJSON(req, code, errorResponse{
+		Error: msg,
+	})
+}
+
+func respondWithJSON(req http.ResponseWriter, code int, payload interface{}) {
+	req.Header().Set("Content-Type", "application/json")
+	dat, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Error marshalling JSON: %s", err)
+		req.WriteHeader(500)
+		return
+	}
+	req.WriteHeader(code)
+	req.Write(dat)
 }
