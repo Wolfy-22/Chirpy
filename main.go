@@ -62,6 +62,7 @@ func main() {
 	mux.HandleFunc("POST /api/login", apiCfg.login)
 	mux.HandleFunc("POST /api/refresh", apiCfg.refresh)
 	mux.HandleFunc("POST /api/revoke", apiCfg.revokeToken)
+	mux.HandleFunc("PUT /api/users", apiCfg.updateUser)
 
 	server := http.Server{
 		Handler: mux,
@@ -70,6 +71,121 @@ func main() {
 
 	server.ListenAndServe()
 
+}
+
+func (cfg *apiConfig) updateUser(res http.ResponseWriter, req *http.Request) {
+	accessToken, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(res, http.StatusUnauthorized, "Couldn't find token", err)
+		return
+	}
+
+	userID, err := auth.ValidateJWT(accessToken, cfg.secret)
+	if err != nil {
+		respondWithError(res, http.StatusUnauthorized, "Couldn't validate JWT", err)
+		return
+	}
+
+	type newUserDate struct {
+		NewEmail    string `json:"email"`
+		NewPassword string `json:"password"`
+	}
+
+	type updateResponse struct {
+		ID        uuid.UUID `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Email     string    `json:"email"`
+	}
+
+	decoder := json.NewDecoder(req.Body)
+	params := newUserDate{}
+	err = decoder.Decode(&params)
+	if err != nil {
+		respondWithError(res, http.StatusInternalServerError, "Couldn't decode parameters", err)
+		return
+	}
+
+	hashedPassword, err := auth.HashPassword(params.NewPassword)
+	if err != nil {
+		log.Printf("Error hashing password: %s", err)
+		res.WriteHeader(400)
+		return
+	}
+
+	user, err := cfg.dbQueries.UpdateUserEmailAndPasswordByUserID(req.Context(), database.UpdateUserEmailAndPasswordByUserIDParams{
+		Email:          params.NewEmail,
+		HashedPassword: hashedPassword,
+		ID:             userID,
+	})
+	if err != nil {
+		respondWithError(res, http.StatusInternalServerError, "Couldn't update user", err)
+		return
+	}
+
+	respondWithJSON(res, 200, updateResponse{
+		ID:        user.ID,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+		Email:     user.Email,
+	})
+
+}
+
+func (cfg *apiConfig) createChirp(res http.ResponseWriter, req *http.Request) {
+	type Chirp struct {
+		ID        uuid.UUID `json:"id"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+		UserID    uuid.UUID `json:"user_id"`
+		Body      string    `json:"body"`
+	}
+
+	type parameters struct {
+		Body string `json:"body"`
+	}
+
+	token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(res, http.StatusUnauthorized, "Couldn't find JWT", err)
+		return
+	}
+	userID, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		respondWithError(res, http.StatusUnauthorized, "Couldn't validate JWT", err)
+		return
+	}
+
+	decoder := json.NewDecoder(req.Body)
+	params := parameters{}
+	err = decoder.Decode(&params)
+	if err != nil {
+		respondWithError(res, http.StatusInternalServerError, "Couldn't decode parameters", err)
+		return
+	}
+
+	cleaned, err := validateChirp(params.Body)
+	if err != nil {
+		respondWithError(res, http.StatusBadRequest, err.Error(), err)
+		return
+	}
+
+	chirp, err := cfg.dbQueries.CreateChirp(req.Context(), database.CreateChirpParams{
+		Body:   cleaned,
+		UserID: userID,
+	})
+	if err != nil {
+		respondWithError(res, http.StatusInternalServerError, "Couldn't create chirp", err)
+		return
+	}
+
+	respondWithJSON(res, http.StatusCreated, Chirp{
+		ID:        chirp.ID,
+		CreatedAt: chirp.CreatedAt,
+		UpdatedAt: chirp.UpdatedAt,
+		Body:      chirp.Body,
+		UserID:    chirp.UserID,
+	})
 }
 
 func (cfg *apiConfig) revokeToken(res http.ResponseWriter, req *http.Request) {
@@ -346,62 +462,6 @@ func (cfg *apiConfig) addUser(res http.ResponseWriter, req *http.Request) {
 	res.WriteHeader(201)
 	res.Write(dat)
 
-}
-
-func (cfg *apiConfig) createChirp(res http.ResponseWriter, req *http.Request) {
-	type Chirp struct {
-		ID        uuid.UUID `json:"id"`
-		CreatedAt time.Time `json:"created_at"`
-		UpdatedAt time.Time `json:"updated_at"`
-		UserID    uuid.UUID `json:"user_id"`
-		Body      string    `json:"body"`
-	}
-
-	type parameters struct {
-		Body string `json:"body"`
-	}
-
-	token, err := auth.GetBearerToken(req.Header)
-	if err != nil {
-		respondWithError(res, http.StatusUnauthorized, "Couldn't find JWT", err)
-		return
-	}
-	userID, err := auth.ValidateJWT(token, cfg.secret)
-	if err != nil {
-		respondWithError(res, http.StatusUnauthorized, "Couldn't validate JWT", err)
-		return
-	}
-
-	decoder := json.NewDecoder(req.Body)
-	params := parameters{}
-	err = decoder.Decode(&params)
-	if err != nil {
-		respondWithError(res, http.StatusInternalServerError, "Couldn't decode parameters", err)
-		return
-	}
-
-	cleaned, err := validateChirp(params.Body)
-	if err != nil {
-		respondWithError(res, http.StatusBadRequest, err.Error(), err)
-		return
-	}
-
-	chirp, err := cfg.dbQueries.CreateChirp(req.Context(), database.CreateChirpParams{
-		Body:   cleaned,
-		UserID: userID,
-	})
-	if err != nil {
-		respondWithError(res, http.StatusInternalServerError, "Couldn't create chirp", err)
-		return
-	}
-
-	respondWithJSON(res, http.StatusCreated, Chirp{
-		ID:        chirp.ID,
-		CreatedAt: chirp.CreatedAt,
-		UpdatedAt: chirp.UpdatedAt,
-		Body:      chirp.Body,
-		UserID:    chirp.UserID,
-	})
 }
 
 func validateChirp(body string) (string, error) {
