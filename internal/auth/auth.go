@@ -29,6 +29,7 @@ func HashPassword(pswd string) (string, error) {
 		return "", fmt.Errorf("error creating password hash: %w", err)
 	}
 	return hash, nil
+
 }
 
 func CheckPasswordHash(pswd, hash string) (bool, error) {
@@ -68,12 +69,16 @@ func ValidateJWT(tokenString, tokenSecret string) (uuid.UUID, error) {
 		return uuid.Nil, err
 	}
 
-	userIDString, err := token.Claims.GetSubject()
+	if !token.Valid {
+		return uuid.Nil, errors.New("invalid token")
+	}
+
+	userIDString, err := claimsStruct.GetSubject()
 	if err != nil {
 		return uuid.Nil, err
 	}
 
-	issuer, err := token.Claims.GetIssuer()
+	issuer, err := claimsStruct.GetIssuer()
 	if err != nil {
 		return uuid.Nil, err
 	}
@@ -86,6 +91,18 @@ func ValidateJWT(tokenString, tokenSecret string) (uuid.UUID, error) {
 		return uuid.Nil, fmt.Errorf("invalid user ID: %w", err)
 	}
 	return id, nil
+}
+
+func GetAPIKey(headers http.Header) (string, error) {
+	authHeader := headers.Get("Authorization")
+	if authHeader == "" {
+		return "", ErrNoAuthHeaderIncluded
+	}
+
+	trimmed := strings.Split(authHeader, " ")
+	trimmed[1] = strings.Trim(trimmed[1], "")
+
+	return trimmed[1], nil
 }
 
 func GetBearerToken(headers http.Header) (string, error) {

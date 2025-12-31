@@ -6,7 +6,10 @@ create table users (
     email TEXT not null unique,
     
     -- new--
-    hashed_password TEXT not null default 'unset'
+    hashed_password TEXT not null default 'unset',
+
+    -- new --
+    is_chirpy_red boolean not null default false
 );
 
 -- +goose Down

@@ -28,6 +28,7 @@ type apiConfig struct {
 	dbQueries      *database.Queries
 	platform       string
 	secret         string
+	polka_key      string
 }
 
 func main() {
@@ -35,6 +36,7 @@ func main() {
 	dbURL := os.Getenv("DB_URL")
 	platform := os.Getenv("PLATFORM")
 	secret := os.Getenv("SECRET")
+	polkaKey := os.Getenv("POLKA_KEY")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Printf("Error connecting to database: %s", err)
@@ -48,6 +50,7 @@ func main() {
 		dbQueries:      dbQ,
 		platform:       platform,
 		secret:         secret,
+		polka_key:      polkaKey,
 	}
 
 	mux.Handle("/app/", apiCfg.middlewareMetricsInc(handler()))
@@ -63,6 +66,8 @@ func main() {
 	mux.HandleFunc("POST /api/refresh", apiCfg.refresh)
 	mux.HandleFunc("POST /api/revoke", apiCfg.revokeToken)
 	mux.HandleFunc("PUT /api/users", apiCfg.updateUser)
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.deleteChirp)
+	mux.HandleFunc("POST /api/polka/webhooks", apiCfg.updateToRed)
 
 	server := http.Server{
 		Handler: mux,
@@ -71,6 +76,92 @@ func main() {
 
 	server.ListenAndServe()
 
+}
+
+func (cfg *apiConfig) updateToRed(res http.ResponseWriter, req *http.Request) {
+	type data struct {
+		UserID string `json:"user_id"`
+	}
+	type reqData struct {
+		Event string `json:"event"`
+		Data  data   `json:"data"`
+	}
+
+	decoder := json.NewDecoder(req.Body)
+	params := reqData{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		respondWithError(res, http.StatusInternalServerError, "Couldn't decode parameters", err)
+		return
+	}
+
+	if params.Event != "user.upgraded" {
+		respondWithError(res, 204, "Incorrect event", errors.New("event must be user.upgraded"))
+		return
+	}
+
+	UserID, err := uuid.Parse(params.Data.UserID)
+	if err != nil {
+		respondWithError(res, http.StatusInternalServerError, "Error parsing ID", err)
+		return
+	}
+
+	apiKey, err := auth.GetAPIKey(req.Header)
+	if err != nil {
+		respondWithError(res, http.StatusUnauthorized, "Couldn't find Key", err)
+		return
+	}
+
+	if apiKey != cfg.polka_key {
+		respondWithError(res, http.StatusUnauthorized, "Incorrect api key", err)
+	}
+
+	err = cfg.dbQueries.UpgradesToChirpyRedViaID(req.Context(), UserID)
+	if err != nil {
+		respondWithError(res, http.StatusNotFound, "user id not found", err)
+		return
+	}
+
+	res.WriteHeader(204)
+}
+
+func (cfg *apiConfig) deleteChirp(res http.ResponseWriter, req *http.Request) {
+	chirpIDString := req.PathValue("chirpID")
+	chirpID, err := uuid.Parse(chirpIDString)
+	if err != nil {
+		respondWithError(res, http.StatusBadRequest, "Invalid chirp ID", err)
+		return
+	}
+
+	accessToken, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(res, http.StatusUnauthorized, "Couldn't find token", err)
+		return
+	}
+
+	USER_ID, err := auth.ValidateJWT(accessToken, cfg.secret)
+	if err != nil {
+		respondWithError(res, 403, "Not author of chirp", err)
+		return
+	}
+
+	dbChirp, err := cfg.dbQueries.GetChirpByID(req.Context(), chirpID)
+	if err != nil {
+		respondWithError(res, http.StatusNotFound, "Couldn't find chirp", err)
+		return
+	}
+	if dbChirp.UserID != USER_ID {
+		respondWithError(res, http.StatusForbidden, "You can't delete this chirp", err)
+		return
+	}
+
+	err = cfg.dbQueries.DeleteChirpByID(req.Context(), chirpID)
+	if err != nil {
+		respondWithError(res, http.StatusInternalServerError, "No chirp found", err)
+		return
+	}
+
+	res.WriteHeader(204)
 }
 
 func (cfg *apiConfig) updateUser(res http.ResponseWriter, req *http.Request) {
@@ -96,6 +187,7 @@ func (cfg *apiConfig) updateUser(res http.ResponseWriter, req *http.Request) {
 		CreatedAt time.Time `json:"created_at"`
 		UpdatedAt time.Time `json:"updated_at"`
 		Email     string    `json:"email"`
+		ChirpyRed bool      `json:"is_chirpy_red"`
 	}
 
 	decoder := json.NewDecoder(req.Body)
@@ -128,6 +220,7 @@ func (cfg *apiConfig) updateUser(res http.ResponseWriter, req *http.Request) {
 		CreatedAt: user.CreatedAt,
 		UpdatedAt: user.UpdatedAt,
 		Email:     user.Email,
+		ChirpyRed: user.IsChirpyRed,
 	})
 
 }
@@ -247,6 +340,7 @@ func (cfg *apiConfig) login(res http.ResponseWriter, req *http.Request) {
 		CreatedAt    time.Time `json:"created_at"`
 		UpdatedAt    time.Time `json:"updated_at"`
 		Email        string    `json:"email"`
+		ChirpyRed    bool      `json:"is_chirpy_red"`
 		RefreshToken string    `json:"refresh_token"`
 		AccessToken  string    `json:"token"`
 	}
@@ -306,6 +400,7 @@ func (cfg *apiConfig) login(res http.ResponseWriter, req *http.Request) {
 		CreatedAt:    user.CreatedAt,
 		UpdatedAt:    user.UpdatedAt,
 		Email:        user.Email,
+		ChirpyRed:    user.IsChirpyRed,
 		AccessToken:  access_token,
 		RefreshToken: refresh_token,
 	}
@@ -416,6 +511,7 @@ func (cfg *apiConfig) addUser(res http.ResponseWriter, req *http.Request) {
 		UpdatedAt time.Time `json:"updated_at"`
 		Email     string    `json:"email"`
 		Password  string    `json:"hashed_password"`
+		ChirpyRed bool      `json:"is_chirpy_red"`
 	}
 
 	decoder := json.NewDecoder(req.Body)
@@ -449,6 +545,7 @@ func (cfg *apiConfig) addUser(res http.ResponseWriter, req *http.Request) {
 		CreatedAt: user.CreatedAt,
 		UpdatedAt: user.UpdatedAt,
 		Email:     user.Email,
+		ChirpyRed: user.IsChirpyRed,
 	}
 
 	dat, err := json.Marshal(respBody)
