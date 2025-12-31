@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -468,12 +469,33 @@ func (cfg *apiConfig) getChirps(res http.ResponseWriter, req *http.Request) {
 		UserID    uuid.UUID `json:"user_id"`
 	}
 
-	chirps, err := cfg.dbQueries.GetAllChirps(req.Context())
+	sortType := req.URL.Query().Get("sort")
+
+	chirps, err := cfg.dbQueries.GetAllChirpsAsc(req.Context())
 	if err != nil {
 		log.Printf("Error getting chirps: %s", err)
 		res.WriteHeader(400)
 		return
 	}
+
+	query := req.URL.Query().Get("author_id")
+	if query != "" {
+		userID, err := uuid.Parse(query)
+		if err != nil {
+			respondWithError(res, http.StatusInternalServerError, "Could not parse userID", err)
+			return
+		}
+		chirps, err = cfg.dbQueries.GetChirpsByUserIDAsc(req.Context(), userID)
+		if err != nil {
+			respondWithError(res, http.StatusInternalServerError, "Error retrieving chirps", err)
+			return
+		}
+	}
+
+	if sortType == "desc" {
+		sort.Slice(chirps, func(i, j int) bool { return chirps[i].CreatedAt.After(chirps[j].CreatedAt) })
+	}
+
 	var fixedChirps []Chirp
 	var fixedChrip Chirp
 	for _, chirp := range chirps {
@@ -487,16 +509,7 @@ func (cfg *apiConfig) getChirps(res http.ResponseWriter, req *http.Request) {
 		fixedChirps = append(fixedChirps, fixedChrip)
 	}
 
-	dat, err := json.Marshal(fixedChirps)
-	if err != nil {
-		log.Printf("Error marshalling json: %s", err)
-		res.WriteHeader(400)
-		return
-	}
-
-	res.Header().Set("Content-Type", "application/json")
-	res.WriteHeader(200)
-	res.Write(dat)
+	respondWithJSON(res, http.StatusOK, fixedChirps)
 }
 
 func (cfg *apiConfig) addUser(res http.ResponseWriter, req *http.Request) {
